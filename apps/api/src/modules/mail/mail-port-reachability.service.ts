@@ -3,8 +3,8 @@
  *
  * This combines two different facts without conflating them:
  *   1. a listener scan on the mail host; and
- *   2. an off-box TCP connection from the Openship control plane to the public
- *      DNS address.
+ *   2. a TCP connection from the Openship API to the public DNS address. On a
+ *      single-server install, this originates on the mail host itself.
  *
  * The first catches a stopped daemon or loopback-only bind. The second catches
  * host/provider firewalls and NAT rules. Neither fact alone can diagnose both.
@@ -22,25 +22,20 @@ export const REQUIRED_PUBLIC_MAIL_PORTS = [
   { key: "imaps", port: 993, label: "IMAP (TLS)" },
 ] as const;
 
-/** Mail-client ports. Unlike inbound SMTP, these are not filtered by cloud outbound-25 throttles. */
-export const CLIENT_PUBLIC_MAIL_PORTS = [465, 587, 993] as const;
-
-export const SMTP_INBOUND_PORT = 25;
+const SMTP_INBOUND_PORT = 25;
 
 /**
- * Why a public :25 timeout is often not a setup wall: AWS (and some other
- * clouds) filter TCP 25 originating FROM the instance. The wizard probe runs
- * on the Openship control plane, which on a single-box self-host is that same
- * instance, so the "public" dial of `mail.example.com:25` is actually outbound
- * port 25 from the box. That times out even when inbound MX from the internet
- * would succeed, and even when operators send through SES / another relay.
+ * The API's outbound-25 filter and the mail host's inbound firewall can produce
+ * the same timeout. Client-port handshakes cannot distinguish them, so keep
+ * inbound reachability unverified until it is checked independently.
  */
-export const SMTP_INBOUND_SOFT_BLOCK_DETAIL =
-  "Inbound TCP 25 could not be verified from the control plane. Many clouds " +
-  "(especially AWS) filter instance-originated port 25, so this probe can time " +
-  "out even when inbound MX delivery works. SMTP submission (465/587) and IMAP " +
-  "(993) are reachable. Route sending through an SMTP provider on the Sending " +
-  "tab if outbound port 25 is blocked.";
+const SMTP_INBOUND_UNVERIFIED_DETAIL =
+  "Inbound TCP 25 could not be verified from the Openship API server. Providers " +
+  "such as AWS can block this server's outbound port 25 even when inbound mail " +
+  "works. Submission (465/587) and IMAP (993) are reachable. Verify port 25 from " +
+  "an independent host or send a test message from another mail provider before " +
+  "relying on inbound delivery. An SMTP relay in the Sending tab handles " +
+  "outgoing mail only.";
 
 export type MailPortReachabilityStatus =
   | "reachable"
@@ -72,19 +67,23 @@ export interface MailPortReachability {
 }
 
 /**
- * True when :25 is listening on a public bind, the control-plane probe timed
- * out, and every mail-client port completed a TCP handshake. Local bind
- * failures (not listening / loopback-only) stay hard failures.
+ * Only an isolated :25 timeout is ambiguous. Refusals, routing errors, local
+ * bind failures, and unverified client ports must not receive this exception.
  */
-export function isControlPlaneSmtpInboundSoftBlock(
-  ports: readonly MailPortReachabilityCheck[],
-): boolean {
+function isSmtpInboundUnverified(ports: readonly MailPortReachabilityCheck[]): boolean {
   const smtp = ports.find((port) => port.port === SMTP_INBOUND_PORT);
-  if (!smtp || smtp.status !== "blocked" || !smtp.listening || !smtp.exposed) {
+  if (
+    !smtp ||
+    smtp.status !== "blocked" ||
+    smtp.failure !== "timeout" ||
+    !smtp.listening ||
+    !smtp.exposed
+  ) {
     return false;
   }
-  return CLIENT_PUBLIC_MAIL_PORTS.every(
-    (port) => ports.find((row) => row.port === port)?.status === "reachable",
+  return REQUIRED_PUBLIC_MAIL_PORTS.every(
+    ({ port }) =>
+      port === SMTP_INBOUND_PORT || ports.find((row) => row.port === port)?.status === "reachable",
   );
 }
 
@@ -263,22 +262,19 @@ async function runMailPortReachability(
     };
   });
 
-  const smtpInboundSoftBlock = isControlPlaneSmtpInboundSoftBlock(ports);
+  const smtpInboundUnverified = isSmtpInboundUnverified(ports);
   const hardFailure = ports.some((port) => {
-    if (smtpInboundSoftBlock && port.port === SMTP_INBOUND_PORT && port.status === "blocked") {
+    if (smtpInboundUnverified && port.port === SMTP_INBOUND_PORT) {
       return false;
     }
     return (
       port.status === "blocked" || port.status === "not_listening" || port.status === "not_exposed"
     );
   });
-  const unknown = ports.some((port) => port.status === "unknown");
-  const detail = [
-    resolutionDetail,
-    smtpInboundSoftBlock ? SMTP_INBOUND_SOFT_BLOCK_DETAIL : undefined,
-  ]
-    .filter((part): part is string => Boolean(part))
-    .join(" ");
+  // Preserve the failed probe in the per-port reading. The aggregate is unknown,
+  // never healthy, while setup can use its existing warning path to continue.
+  const unknown = smtpInboundUnverified || ports.some((port) => port.status === "unknown");
+  const detail = smtpInboundUnverified ? SMTP_INBOUND_UNVERIFIED_DETAIL : resolutionDetail;
   return {
     hostname,
     address,

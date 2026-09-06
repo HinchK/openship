@@ -24,9 +24,7 @@ import type { CommandExecutor, SystemLogCallback, SystemLog } from "@repo/adapte
 import { checkMailHealth, requiresMailComponent } from "./mail-health.service";
 import {
   checkMailPortReachability,
-  isControlPlaneSmtpInboundSoftBlock,
   mailReachabilityFailureMessage,
-  SMTP_INBOUND_SOFT_BLOCK_DETAIL,
 } from "./mail-port-reachability.service";
 import { safeErrorMessage, mailHostname } from "@repo/core";
 import {
@@ -1149,11 +1147,10 @@ export async function stepConfigureSSL(
 /**
  * Step 9: prove the public path, not merely the local listener.
  *
- * A provider firewall sits outside the server and cannot be inspected or changed
- * through SSH. The only reliable signal is therefore an off-box connection from
- * the control plane to the public-DNS address. A real negative blocks completion;
- * an unavailable probe is a warning because the control plane itself may lack an
- * IPv6 route or public DNS at that moment.
+ * The API connects to the public DNS address after checking the host listeners.
+ * A known failure blocks completion. An unavailable probe or an isolated inbound
+ * SMTP timeout remains unverified: the API's own outbound-25 filter may prevent
+ * the check. These use the same warning path, without declaring mail healthy.
  */
 export async function stepVerifyMailReachability(
   exec: CommandExecutor,
@@ -1180,19 +1177,6 @@ export async function stepVerifyMailReachability(
       stepId,
       success: true,
       message: "Mail is listening, but public reachability could not be verified",
-      warning,
-      data: { reachability },
-    };
-  }
-
-  if (isControlPlaneSmtpInboundSoftBlock(reachability.ports)) {
-    const warning = reachability.detail ?? SMTP_INBOUND_SOFT_BLOCK_DETAIL;
-    log(stepId, "warn", warning);
-    return {
-      stepId,
-      success: true,
-      message:
-        "Public submission and IMAP are reachable; inbound TCP 25 could not be verified from the control plane",
       warning,
       data: { reachability },
     };
