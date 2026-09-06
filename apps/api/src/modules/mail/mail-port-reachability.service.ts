@@ -3,8 +3,8 @@
  *
  * This combines two different facts without conflating them:
  *   1. a listener scan on the mail host; and
- *   2. an off-box TCP connection from the Openship control plane to the public
- *      DNS address.
+ *   2. a TCP connection from the Openship API to the public DNS address. On a
+ *      single-server install, this originates on the mail host itself.
  *
  * The first catches a stopped daemon or loopback-only bind. The second catches
  * host/provider firewalls and NAT rules. Neither fact alone can diagnose both.
@@ -21,6 +21,21 @@ export const REQUIRED_PUBLIC_MAIL_PORTS = [
   { key: "submission", port: 587, label: "SMTP submission (STARTTLS)" },
   { key: "imaps", port: 993, label: "IMAP (TLS)" },
 ] as const;
+
+const SMTP_INBOUND_PORT = 25;
+
+/**
+ * The API's outbound-25 filter and the mail host's inbound firewall can produce
+ * the same timeout. Client-port handshakes cannot distinguish them, so keep
+ * inbound reachability unverified until it is checked independently.
+ */
+const SMTP_INBOUND_UNVERIFIED_DETAIL =
+  "Inbound TCP 25 could not be verified from the Openship API server. Providers " +
+  "such as AWS can block this server's outbound port 25 even when inbound mail " +
+  "works. Submission (465/587) and IMAP (993) are reachable. Verify port 25 from " +
+  "an independent host or send a test message from another mail provider before " +
+  "relying on inbound delivery. An SMTP relay in the Sending tab handles " +
+  "outgoing mail only.";
 
 export type MailPortReachabilityStatus =
   | "reachable"
@@ -49,6 +64,27 @@ export interface MailPortReachability {
   status: "ok" | "fail" | "unknown";
   ports: MailPortReachabilityCheck[];
   detail?: string;
+}
+
+/**
+ * Only an isolated :25 timeout is ambiguous. Refusals, routing errors, local
+ * bind failures, and unverified client ports must not receive this exception.
+ */
+function isSmtpInboundUnverified(ports: readonly MailPortReachabilityCheck[]): boolean {
+  const smtp = ports.find((port) => port.port === SMTP_INBOUND_PORT);
+  if (
+    !smtp ||
+    smtp.status !== "blocked" ||
+    smtp.failure !== "timeout" ||
+    !smtp.listening ||
+    !smtp.exposed
+  ) {
+    return false;
+  }
+  return REQUIRED_PUBLIC_MAIL_PORTS.every(
+    ({ port }) =>
+      port === SMTP_INBOUND_PORT || ports.find((row) => row.port === port)?.status === "reachable",
+  );
 }
 
 interface ReachabilityDependencies {
@@ -226,18 +262,26 @@ async function runMailPortReachability(
     };
   });
 
-  const hardFailure = ports.some(
-    (port) =>
-      port.status === "blocked" || port.status === "not_listening" || port.status === "not_exposed",
-  );
-  const unknown = ports.some((port) => port.status === "unknown");
+  const smtpInboundUnverified = isSmtpInboundUnverified(ports);
+  const hardFailure = ports.some((port) => {
+    if (smtpInboundUnverified && port.port === SMTP_INBOUND_PORT) {
+      return false;
+    }
+    return (
+      port.status === "blocked" || port.status === "not_listening" || port.status === "not_exposed"
+    );
+  });
+  // Preserve the failed probe in the per-port reading. The aggregate is unknown,
+  // never healthy, while setup can use its existing warning path to continue.
+  const unknown = smtpInboundUnverified || ports.some((port) => port.status === "unknown");
+  const detail = smtpInboundUnverified ? SMTP_INBOUND_UNVERIFIED_DETAIL : resolutionDetail;
   return {
     hostname,
     address,
     checkedAt,
     status: hardFailure ? "fail" : unknown ? "unknown" : "ok",
     ports,
-    ...(resolutionDetail ? { detail: resolutionDetail } : {}),
+    ...(detail ? { detail } : {}),
   };
 }
 

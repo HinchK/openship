@@ -41,6 +41,56 @@ function reading(status: "ok" | "fail" | "unknown") {
   };
 }
 
+function unverifiedInboundSmtp() {
+  return {
+    hostname: "mail.example.com",
+    address: "203.0.113.10",
+    checkedAt: 0,
+    status: "unknown" as const,
+    detail:
+      "Inbound TCP 25 could not be verified. Test receiving independently; an SMTP relay in the Sending tab handles outgoing mail only.",
+    ports: [
+      {
+        key: "smtp" as const,
+        port: 25,
+        label: "SMTP inbound",
+        status: "blocked" as const,
+        listening: true,
+        exposed: true,
+        reachable: false,
+        failure: "timeout" as const,
+      },
+      {
+        key: "smtps" as const,
+        port: 465,
+        label: "SMTP submission (TLS)",
+        status: "reachable" as const,
+        listening: true,
+        exposed: true,
+        reachable: true,
+      },
+      {
+        key: "submission" as const,
+        port: 587,
+        label: "SMTP submission (STARTTLS)",
+        status: "reachable" as const,
+        listening: true,
+        exposed: true,
+        reachable: true,
+      },
+      {
+        key: "imaps" as const,
+        port: 993,
+        label: "IMAP (TLS)",
+        status: "reachable" as const,
+        listening: true,
+        exposed: true,
+        reachable: true,
+      },
+    ],
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -71,5 +121,29 @@ describe("mail setup public reachability gate", () => {
 
     expect(result.success).toBe(true);
     expect(result.warning).toMatch(/Public DNS/i);
+  });
+
+  it("completes with a warning without declaring unverified inbound SMTP healthy", async () => {
+    const reachability = unverifiedInboundSmtp();
+    const log = vi.fn();
+    h.check.mockResolvedValue(reachability);
+
+    const result = await stepVerifyMailReachability(executor, "example.com", log);
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBe(reachability.detail);
+    expect(result.message).toMatch(/could not be verified/i);
+    expect(result.data?.reachability).toMatchObject({ status: "unknown" });
+    expect(log).toHaveBeenCalledWith(9, "warn", reachability.detail);
+  });
+
+  it("completes without a warning after a successful public check", async () => {
+    h.check.mockResolvedValue(reading("ok"));
+
+    const result = await stepVerifyMailReachability(executor, "example.com", vi.fn());
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+    expect(result.message).toBe("Public SMTP and IMAP ports are reachable");
   });
 });
