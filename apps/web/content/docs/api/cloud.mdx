@@ -279,7 +279,7 @@ from the dashboard.
 | The connected cloud account (name, email, avatar). | `GET /api/cloud/account`<br />`cloud:read` |
 | Proxy Oblien analytics for a hostname in the caller's namespace. | `POST /api/cloud/analytics`<br />`cloud:write` |
 | Consent page mints a one-time handoff code (cookie session checked inline). | `POST /api/cloud/connect-authorize`<br />`Handler authentication` |
-| Complete the connect popup: exchange the PKCE code and store the cloud bearer. | `POST /api/cloud/connect-finalize`<br />`cloud:admin` |
+| Complete the connect popup: exchange the PKCE code and store the cloud bearer. | `POST /api/cloud/connect-finalize`<br />`cloud:admin` · Self-hosted |
 | Validate connect params, then 302 to the dashboard consent page. | `GET /api/cloud/connect-handoff`<br />`Handler authentication` |
 | Poll the local Cloud connection handoff. | `GET /api/cloud/connect-poll`<br />`Handler authentication` |
 | OAuth → one-time code → redirect to the desktop app callback. | `GET /api/cloud/desktop-handoff`<br />`Handler authentication` |
@@ -307,9 +307,9 @@ from the dashboard.
 | Run an allowed Pages or routing action after verifying customer namespace ownership. | `POST /api/cloud/resource-proxy`<br />`cloud:write` |
 | Read routes or certificates belonging to the caller's Cloud namespace. | `GET /api/cloud/route-registry`<br />`cloud:read` |
 | Relay an invitation email via the SaaS mail infrastructure. | `POST /api/cloud/send-invitation`<br />`cloud:write` |
-| Openship Cloud connection status for this instance. | `GET /api/cloud/status`<br />`cloud:read` |
+| Openship Cloud connection status for this instance. | `GET /api/cloud/status`<br />`cloud:read` · Self-hosted |
 | Delete a project's rows on the SaaS (bring-home / reconcile). | `POST /api/cloud/teardown-project`<br />`cloud:admin` |
 | Mint a namespace-scoped Oblien token for the caller's org. | `POST /api/cloud/token`<br />`cloud:write` |
-| List the org's Openship Cloud (Oblien) workspaces, with drift (orphaned cloud/local). | `GET /api/cloud/workspaces`<br />`cloud:read` |
+| List the org's Openship Cloud (Oblien) workspaces, with drift (orphaned cloud/local). | `GET /api/cloud/workspaces`<br />`cloud:read` · Self-hosted |
 
 {/* api-operations:end */}

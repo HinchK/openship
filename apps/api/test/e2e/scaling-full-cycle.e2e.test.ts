@@ -28,6 +28,8 @@ import type {
   ResolvedDeploymentPlatform,
 } from "@repo/platform/engine/lib/deployment-runtime";
 import { OpenshipClient, consumeDeploymentEvents } from "@repo/sdk/client";
+import type { ProjectCluster } from "@repo/contracts";
+import { mcpTestClient } from "../helpers/mcp-client";
 import { describeDockerE2E, requireDocker } from "../helpers/docker-e2e";
 import { seedOrg, seedProject } from "../helpers/seed";
 import {
@@ -49,12 +51,17 @@ vi.hoisted(() => {
   process.env.OPENSHIP_JOB_RUNNER = "in-process";
 });
 
+// MCP re-enters the same real routers, without app.ts's unrelated boot jobs.
+const forwarding = vi.hoisted(() => ({ fetch: vi.fn() }));
+vi.mock("../../src/app", () => ({ app: forwarding }));
+
 describeDockerE2E.sequential("application scaling through the complete deployment cycle", () => {
   const lab = new ScalingLab();
   let project: Project;
   let clusterId = "";
   let source = "";
   let client: OpenshipClient;
+  let mcp: ReturnType<typeof mcpTestClient>;
   let httpServer: ServerType | undefined;
   let baseRuntime: DockerRuntime | undefined;
   let org: Awaited<ReturnType<typeof seedOrg>>;
@@ -292,7 +299,10 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
       const { projectRoutes } = await import("../../src/modules/projects/project.routes");
       const { deploymentRoutes } = await import("../../src/modules/deployments/deployment.routes");
       const { healthRoutes } = await import("../../src/modules/health/health.routes");
+      const { permissionsRoutes } = await import("../../src/modules/permissions/permissions.routes");
+      const { mcpRoutes } = await import("../../src/modules/mcp/mcp.routes");
       const { handleApiError } = await import("../../src/middleware/error-handler");
+      const { clientIpMiddleware } = await import("../../src/middleware/client-ip");
       const { mintPatToken } = await import("@repo/platform/engine/lib/pat");
       const pat = mintPatToken();
       await repos.personalAccessToken.create({
@@ -307,9 +317,13 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
       });
       const app = new Hono()
         .onError(handleApiError)
+        .use("*", clientIpMiddleware)
         .route("/api/health", healthRoutes)
         .route("/api/projects", projectRoutes)
-        .route("/api/deployments", deploymentRoutes);
+        .route("/api/deployments", deploymentRoutes)
+        .route("/api/permissions", permissionsRoutes)
+        .route("/api/mcp", mcpRoutes);
+      forwarding.fetch.mockImplementation((request: Request) => app.fetch(request));
       const address = await new Promise<number>((resolve) => {
         httpServer = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 }, (address) =>
           resolve(address.port),
@@ -319,6 +333,10 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
         baseUrl: `http://127.0.0.1:${address}`,
         token: pat.token,
         organizationId: org.organizationId,
+      });
+      mcp = mcpTestClient({
+        request: (path, init) => fetch(`http://127.0.0.1:${address}${path}`, init),
+        token: pat.token, organizationId: org.organizationId,
       });
       project = await seedProject(org.organizationId, {
         // A valid OpenShip ID that Kubernetes cannot use directly as a label.
@@ -432,7 +450,7 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
   async function traffic(version: string, instances: number, setting = "") {
     const observed = await eventually(
       "the requested healthy instances",
-      () => client.projects.getClusterWorkload(project.id),
+      () => clusterState(),
       (view) => view.status?.ready === instances && view.status.available === instances,
     );
     expect(observed.error).toBeNull();
@@ -493,22 +511,36 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     return row;
   }
 
-  it("builds, publishes, deploys, balances traffic, scales, updates and rolls back", async () => {
-    const initial = await client.projects.getClusterWorkload(project.id);
+  async function clusterState(): Promise<ProjectCluster> {
+    return (await mcp.call<{ data: ProjectCluster }>("get_projects_by_id_cluster", { id: project.id })).data;
+  }
+  async function scale(input: Parameters<OpenshipClient["projects"]["scaleClusterWorkload"]>[1]) {
+    return (await mcp.call<{ data: { deploymentId: string } }>("post_projects_by_id_cluster_scale", { id: project.id, body: input })).data;
+  }
+  function deploy() {
+    return mcp.call<{ deployment_id: string }>("post_deployments_build_access", { body: { projectId: project.id } });
+  }
+
+  it("builds, publishes, deploys, balances traffic, scales, updates and rolls back through MCP", async () => {
+    const available = await mcp.rpc<{ tools: { name: string }[] }>("tools/list");
+    expect(available.tools.map(tool => tool.name)).toEqual(expect.arrayContaining([
+      "get_permissions_workspaces", "patch_projects_by_id_cluster", "post_projects_by_id_cluster_scale", "delete_projects_by_id",
+    ]));
+    const initial = await clusterState();
     expect(initial.clusterId).toBeNull();
-    await client.projects.setClusterTarget(project.id, {
+    await mcp.call("patch_projects_by_id_cluster", { id: project.id, body: {
       clusterId,
       config: { replicas: 1, imageRepository: lab.repository },
       expectedUpdatedAt: initial.updatedAt,
       stateless: true,
-    });
-    await client.projects.mergeEnvVars(project.id, {
+    } });
+    await mcp.call("patch_projects_by_id_env", { id: project.id, body: {
       environment: "production",
       upserts: [{ key: "SCALING_SETTING", value: "release-one" }],
       deletes: [],
-    });
+    } });
     expect((await repos.deployment.listByProject(project.id)).rows).toHaveLength(0);
-    const started = await client.deployments.buildAccess({ projectId: project.id });
+    const started = await deploy();
     const id = started.deployment_id;
 
     // Closing the progress view must not stop or duplicate the deployment.
@@ -548,16 +580,15 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     expect(buildSpy).toHaveBeenCalledTimes(1);
     expect(publishSpy).toHaveBeenCalledTimes(1);
 
-    const beforeScale = await client.projects.getClusterWorkload(project.id);
+    const beforeScale = await clusterState();
     const scaleInput = {
       replicas: 3,
       expectedDeploymentId: beforeScale.activeDeploymentId!,
       expectedUpdatedAt: beforeScale.updatedAt,
     };
-    const scaled = await client.projects.scaleClusterWorkload(project.id, scaleInput);
-    await expect(
-      client.projects.scaleClusterWorkload(project.id, scaleInput),
-    ).rejects.toMatchObject({ status: 409 });
+    const scaled = await scale(scaleInput);
+    const stale = await mcp.result("post_projects_by_id_cluster_scale", { id: project.id, body: scaleInput });
+    expect(stale).toMatchObject({ isError: true, data: { code: "CLUSTER_WORKLOAD_CONFLICT" } });
     const three = await whileServing(scaled.deploymentId, ["v1"]);
     expect(three.imageRef).toBe(v1.imageRef);
     expect(buildSpy).toHaveBeenCalledTimes(1);
@@ -590,15 +621,15 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
       upserts: [{ key: "SCALING_SETTING", value: "release-two" }],
       deletes: [],
     });
-    const update = await client.deployments.buildAccess({ projectId: project.id });
+    const update = await deploy();
     const v2 = await whileServing(update.deployment_id, ["v1", "v2"]);
     expect(v2.imageRef).not.toBe(v1.imageRef);
     await traffic("v2", 3, "release-two");
     expect(buildSpy).toHaveBeenCalledTimes(2);
     expect(publishSpy).toHaveBeenCalledTimes(2);
 
-    const beforeDown = await client.projects.getClusterWorkload(project.id);
-    const down = await client.projects.scaleClusterWorkload(project.id, {
+    const beforeDown = await clusterState();
+    const down = await scale({
       replicas: 1,
       expectedDeploymentId: beforeDown.activeDeploymentId!,
       expectedUpdatedAt: beforeDown.updatedAt,
@@ -612,7 +643,7 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     );
     // The rollback endpoint returns the selected history row; the asynchronous
     // restore creates a new release. Follow that release, never the old row.
-    await client.deployments.rollback(three.id);
+    await mcp.call("post_deployments_by_id_rollback", { id: three.id });
     const rollback = await eventually(
       "the new rollback release",
       async () =>
@@ -656,18 +687,18 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
   }
 
   it("keeps the active release serving through cancellation and failure, then retries explicitly", async () => {
-    const active = (await client.projects.getClusterWorkload(project.id)).activeDeploymentId!;
+    const active = (await clusterState()).activeDeploymentId!;
     expect(active).toBeTruthy();
     await fixture("waiting", "waiting");
-    const waiting = await client.deployments.buildAccess({ projectId: project.id });
+    const waiting = await deploy();
     await pendingWorkload(waiting.deployment_id);
     await traffic("v1", 3, "release-one");
-    await client.deployments.cancel(waiting.deployment_id);
+    await mcp.call("post_deployments_by_id_cancel", { id: waiting.deployment_id });
     await whileServing(waiting.deployment_id, ["v1"], "cancelled");
-    expect((await client.projects.getClusterWorkload(project.id)).activeDeploymentId).toBe(active);
+    expect((await clusterState()).activeDeploymentId).toBe(active);
 
     await fixture("broken", "crash");
-    const broken = await client.deployments.buildAccess({ projectId: project.id });
+    const broken = await deploy();
     const workload = await pendingWorkload(broken.deployment_id);
     // Shorten only Kubernetes' real deadline for this intentional crash. Its
     // controller still determines failure; no status or API reply is fabricated.
@@ -681,12 +712,12 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     );
     const failed = await whileServing(broken.deployment_id, ["v1"], "failed");
     expect(failed.errorMessage).toMatch(/progress|ready|deadline/i);
-    expect((await client.projects.getClusterWorkload(project.id)).activeDeploymentId).toBe(active);
+    expect((await clusterState()).activeDeploymentId).toBe(active);
     await traffic("v1", 3, "release-one");
 
     const beforeRetry = (await repos.deployment.listByProject(project.id)).rows.length;
     await fixture("v3");
-    const retry = await client.deployments.redeploy(failed.id);
+    const retry = await mcp.call<{ deployment_id: string }>("post_deployments_by_id_redeploy", { id: failed.id });
     const recovered = await whileServing(retry.deployment_id, ["v1", "v3"]);
     expect(recovered.id).not.toBe(failed.id);
     expect((await repos.deployment.findById(failed.id))!.status).toBe("failed");
@@ -697,8 +728,8 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
   }, 600_000);
 
   it("serves from surviving workers and replaces a lost application instance without a new release", async () => {
-    const before = await client.projects.getClusterWorkload(project.id);
-    const scaled = await client.projects.scaleClusterWorkload(project.id, {
+    const before = await clusterState();
+    const scaled = await scale({
       replicas: 3,
       expectedDeploymentId: before.activeDeploymentId!,
       expectedUpdatedAt: before.updatedAt,
@@ -792,7 +823,7 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     );
     await eventually(
       "Kubernetes to replace the deleted instance",
-      () => client.projects.getClusterWorkload(project.id),
+      () => clusterState(),
       (state) =>
         state.status?.ready === 3 &&
         state.status.pods.length === 3 &&
@@ -800,13 +831,13 @@ describeDockerE2E.sequential("application scaling through the complete deploymen
     );
     await traffic("v3", 3, "release-two");
     expect((await repos.deployment.listByProject(project.id)).rows).toHaveLength(history);
-    expect((await client.projects.getClusterWorkload(project.id)).activeDeploymentId).toBe(
+    expect((await clusterState()).activeDeploymentId).toBe(
       scaled.deploymentId,
     );
   }, 360_000);
 
   it("removes the application, its owned namespace and public route through normal project cleanup", async () => {
-    const removed = await client.projects.remove(project.id);
+    const removed = await mcp.call<Awaited<ReturnType<OpenshipClient["projects"]["remove"]>>>("delete_projects_by_id", { id: project.id });
     expect(removed.ok, JSON.stringify(removed.steps)).toBe(true);
     expect(removed.steps.every((step) => step.status !== "failed")).toBe(true);
     await eventually(

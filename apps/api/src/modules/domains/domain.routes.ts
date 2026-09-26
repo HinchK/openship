@@ -5,19 +5,26 @@
  */
 
 import { Hono } from "hono";
+import {
+  DomainResourceSchemas,
+  VerifyPendingDomainsInputSchema,
+  ResourceIdSchema,
+  AddDomainBody,
+  UploadCertBody,
+  PreviewDomainBody,
+} from "@repo/contracts";
+import { Type } from "@sinclair/typebox";
 import { secureRouter } from "../../lib/secure-router";
 import { cloudDomainProxy } from "../../lib/cloud/project-router";
 import * as ctrl from "./domain.controller";
-import { AddDomainBody, UploadCertBody, PreviewDomainBody } from "@repo/contracts";
 
 const r = secureRouter(new Hono(), {
   module: "domains",
   basePath: "/api/domains",
 });
 
-
 /* ─── Domains ──────────────────────────────────────────────────────────── */
-r.get("/", { tag: "domain:list", collectionProject: "query", mcp: { description: "List domains for the project named by the projectId query parameter." } }, ctrl.list);
+r.get("/", { tag: "domain:list", collectionProject: "query", mcp: { description: "List domains for the project named by the projectId query parameter." }, query: Type.Object({ projectId: ResourceIdSchema }) }, ctrl.list);
 r.post(
   "/",
   {
@@ -27,7 +34,8 @@ r.post(
     // fallback asserted {domain,"*"}, which no scoped token can pass.
     collectionProject: true,
     body: AddDomainBody,
-    mcp: { description: "Add a domain (free subdomain or custom)." },
+     mcp: { description: "Add a domain (free subdomain or custom).",
+   },
   },
   ctrl.add,
 );
@@ -42,20 +50,21 @@ r.delete(
   "/:id",
   {
     tag: "domain:admin", auditHandledByOperation: true,
-    mcp: { description: "Delete a domain by id." },
+     mcp: { description: "Delete a domain by id.",
+   },
   },
   cloudDomainProxy,
   ctrl.remove,
 );
-r.post("/:id/verify", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Verify a domain's ownership / DNS." } }, cloudDomainProxy, ctrl.verify);
+r.post("/:id/verify", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Verify a domain's ownership / DNS." } , query: DomainResourceSchemas.verify.input }, cloudDomainProxy, ctrl.verify);
 // Self-hosted live-log verify (SSE): streams certbot's standalone HTTP-01 run.
-r.post("/:id/verify/stream", { tag: "domain:write", auditHandledByOperation: true }, ctrl.verifyStream);
+r.post("/:id/verify/stream", { tag: "domain:write", auditHandledByOperation: true, mcpExcluded: "SSE transport for live progress. Use the resource’s JSON status/log tools over MCP, or an authenticated HTTP client for streaming." }, ctrl.verifyStream);
 r.post("/:id/primary", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Set this domain as the project's primary domain." } }, cloudDomainProxy, ctrl.setPrimary);
-r.get("/:id/records", { tag: "domain:read", mcp: { description: "Get the DNS records for a domain." } }, cloudDomainProxy, ctrl.records);
+r.get("/:id/records", { tag: "domain:read", mcp: { description: "Get the DNS records for a domain." } , query: DomainResourceSchemas.records.input }, cloudDomainProxy, ctrl.records);
 // On-demand DNS auto-configure via a connected provider (Settings→DNS). Plan is a
 // read-only dry-run; apply writes the records on operator press (never silently).
-r.get("/:id/dns/plan", { tag: "domain:read", mcp: { description: "Preview what auto-configuring this domain's DNS through a connected provider would change." } }, cloudDomainProxy, ctrl.dnsPlan);
-r.post("/:id/dns/apply", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Auto-configure this domain's DNS through a connected provider." } }, cloudDomainProxy, ctrl.dnsApply);
+r.get("/:id/dns/plan", { tag: "domain:read", mcp: { description: "Preview what auto-configuring this domain's DNS through a connected provider would change." } , query: DomainResourceSchemas.dnsPlan.input }, cloudDomainProxy, ctrl.dnsPlan);
+r.post("/:id/dns/apply", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Auto-configure this domain's DNS through a connected provider." } , query: DomainResourceSchemas.dnsApply.input }, cloudDomainProxy, ctrl.dnsApply);
 r.post("/:id/renew", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Renew the domain's SSL certificate." } }, cloudDomainProxy, ctrl.renewSsl);
 r.post("/:id/verify-ssl", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Check/verify the domain's SSL certificate." } }, cloudDomainProxy, ctrl.verifySsl);
 // Self-hosted only: installs a cert into the box's OpenResty. On Openship Cloud
@@ -66,7 +75,7 @@ r.post(
   cloudDomainProxy,
   ctrl.uploadCert,
 );
-r.post("/renew-all", { tag: "domain:write", auditHandledByOperation: true }, ctrl.renewAllSsl);
-r.post("/verify-pending", { tag: "domain:write", auditHandledByOperation: true }, ctrl.verifyPending);
+r.post("/renew-all", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Attempt certificate renewal for eligible domains in this workspace. Inspect individual domain SSL state afterward; one domain’s failure does not prove all renewals failed." }, collection: true }, ctrl.renewAllSsl);
+r.post("/verify-pending", { tag: "domain:write", auditHandledByOperation: true, mcp: { description: "Recheck pending domains in this workspace and record current DNS/verification results. Read individual domain status for remaining blockers." }, collection: true, body: VerifyPendingDomainsInputSchema, bodyValidatedByOperation: true }, ctrl.verifyPending);
 
 export const domainRoutes = r.hono;

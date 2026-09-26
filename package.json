@@ -52,7 +52,7 @@
     "release": "bun scripts/release.ts",
     "prepare": "git config core.hooksPath .githooks || true",
     "build:sdk": "bun run --cwd packages/openship build",
-    "docs:reference": "node scripts/generate-api-reference.mjs --write && node scripts/generate-cli-reference.mjs --write",
+    "docs:reference": "node scripts/generate-api-reference.mjs --write && node scripts/generate-cli-reference.mjs --write && node scripts/generate-mcp-reference.mjs --write",
     "docs:check": "node scripts/check-docs.mjs"
   },
   "devDependencies": {
