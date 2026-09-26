@@ -154,6 +154,9 @@ function inputSchema(
   for (const p of pathParams) {
     properties[p] = Type.String({
       minLength: 1,
+      // encodeURIComponent leaves these unchanged, and URL normalization would
+      // select a different endpoint before the request reaches authorization.
+      pattern: "^(?!\\.{1,2}$)",
       description: `The ${p} from the resource's list or detail response.`,
     });
   }

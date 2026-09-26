@@ -36,7 +36,7 @@ body returns `-32600`).
 <TypeTable
   type={{
     jsonrpc: { type: 'string', description: 'Protocol identifier. Must be "2.0".', required: true },
-    method: { type: 'string', description: 'One of: initialize, ping, tools/list, tools/call, notifications/initialized.', required: true },
+    method: { type: 'string', description: 'One of: initialize, ping, tools/list, tools/call, prompts/list, prompts/get, notifications/initialized.', required: true },
     id: { type: 'string | number', description: 'Request id, echoed back in the response. Omit entirely for a notification — the server replies 202 with no body.' },
     params: { type: 'object', description: 'Method arguments — e.g. { protocolVersion } for initialize, { name, arguments } for tools/call.' },
   }}
@@ -170,9 +170,11 @@ the live registry, so a renamed route never leaves a prompt pointing at a stale 
 
 ## Input and workflow contracts
 
-Use `tools/list` as the source of truth for required fields. Path parameters are top-level strings;
-endpoint query parameters belong in `query`; payloads belong in `body`. Missing required arguments
-return `INVALID_TOOL_ARGUMENTS` before dispatch. Optional all-default bodies are sent as `{}`.
+Use `tools/list` as the source of truth for required fields. Path parameters are top-level, nonempty
+strings. The exact values `.` and `..` are rejected so URL normalization cannot select a different
+route; names containing dots, such as `.github`, remain valid. Endpoint query parameters belong in
+`query`; payloads belong in `body`. Invalid or missing required arguments return
+`INVALID_TOOL_ARGUMENTS` before dispatch. Optional all-default bodies are sent as `{}`.
 Validation errors report field paths without echoing submitted values.
 
 A successful call may only have **accepted** asynchronous work. Follow the returned run/deployment/operation

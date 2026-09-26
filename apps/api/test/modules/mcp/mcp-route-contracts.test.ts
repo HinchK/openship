@@ -35,7 +35,10 @@ function tool(name: string) {
   expect(found, name).toBeDefined();
   return found!;
 }
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  forwarding.fetch.mockReset();
+});
 
 describe("MCP route input and transport contracts", () => {
   it.each([
@@ -65,6 +68,52 @@ describe("MCP route input and transport contracts", () => {
     expect(await request.json()).toEqual(args.body);
     expect(request.headers.get("x-organization-id")).toBe("org-a");
     expect(request.headers.get("x-openship-scope")).toBe("fixed");
+  });
+
+  it.each([
+    { owner: ".", repo: "acme" },
+    { owner: "..", repo: "acme" },
+    { owner: "acme", repo: "." },
+    { owner: "acme", repo: ".." },
+  ])(
+    "rejects URL dot segments before a webhook delete can reach another route: %j",
+    async (path) => {
+      forwarding.fetch.mockClear();
+      forwarding.fetch.mockResolvedValueOnce(new Response("{}"));
+      expect(
+        await dispatchTool(
+          tool("delete_github_repos_by_owner_by_repo_webhooks"),
+          { ...path, body: { hookId: 123 } },
+          "test-token",
+          origin,
+        ),
+      ).toMatchObject({
+        ok: false,
+        status: 400,
+        data: { code: "INVALID_TOOL_ARGUMENTS" },
+      });
+      expect(forwarding.fetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves dots and encoded characters inside a resource name", async () => {
+    for (const repo of [".github", "app.v2", "release%2Fbranch", "%2e%2e"]) {
+      forwarding.fetch.mockResolvedValueOnce(new Response("{}"));
+      expect(
+        (
+          await dispatchTool(
+            tool("delete_github_repos_by_owner_by_repo_webhooks"),
+            { owner: "acme", repo, body: { hookId: 123 } },
+            "test-token",
+            origin,
+          )
+        ).ok,
+      ).toBe(true);
+      const request = forwarding.fetch.mock.lastCall![0] as Request;
+      expect(new URL(request.url).pathname).toBe(
+        `/api/github/repos/acme/${encodeURIComponent(repo)}/webhooks`,
+      );
+    }
   });
 
   it("advertises and enforces required path, query and concurrency guards before dispatch", async () => {
