@@ -33,6 +33,7 @@ import Dockerode from "dockerode";
 import * as tarFs from "tar-fs";
 import { randomUUID } from "node:crypto";
 import { createGzip } from "node:zlib";
+import { StringDecoder } from "node:string_decoder";
 
 import type {
   BuildConfig,
@@ -58,6 +59,8 @@ import { resolveDockerBuildArgs } from "./docker-build-args";
 import { dockerPublishedPortInfo } from "./docker-container-info";
 import { applyDockerEnvironment, type DockerEnvironmentOptions } from "./docker-environment";
 import { DEFAULT_CONTAINER_LOG_CONFIG } from "../container-logging";
+import { demuxDockerStream } from "./docker-demux";
+import { releaseCommandDeadline } from "./release-command-deadline";
 
 /**
  * Detect "not found" errors from the Docker SDK (dockerode). The daemon
@@ -119,6 +122,7 @@ import { dockerConfigJsonFor, registryForImage, resolveDockerAuth } from "./dock
 import type {
   RuntimeAdapter,
   RuntimeCapability,
+  ReleaseCommandOptions,
   MultiServiceGroupHandle,
   MultiServiceDeployConfig,
   MultiServiceDeployResult,
@@ -176,6 +180,8 @@ import { splitRuntimeEnv, droppedRuntimeEnvMessage } from "./runtime-env";
 import {
   ownsNetworkEndpoint,
   safeErrorMessage,
+  withTimeout,
+  SYSTEM,
   type ComposeAdvanced,
   type ComposeHealthcheck,
 } from "@repo/core";
@@ -1061,6 +1067,26 @@ export function parseContainerEventLine(line: string): ContainerLifecycleEvent |
 
 // ─── Docker runtime ──────────────────────────────────────────────────────────
 
+/**
+ * The env every container a deployment starts gets: the running app (`deploy`)
+ * and its release commands (`runReleaseCommand`) both take it from here, so a
+ * migration can never resolve a different DSN, PATH or PORT than the app it
+ * prepares. A worker (`portless`) listens on nothing, so injecting PORT would be a
+ * lie the app might bind to — it is omitted there (#538-B). `dropped` is what
+ * `splitRuntimeEnv` refused, returned so each caller can say so in its own log.
+ */
+function deploymentContainerEnv(config: DeployConfig): { env: string[]; dropped: string[] } {
+  const projectEnv = splitRuntimeEnv(config.envVars);
+  return {
+    env: [
+      ...(config.portless ? [] : [`PORT=${config.port}`]),
+      `NODE_ENV=${config.environment === "production" ? "production" : "development"}`,
+      ...projectEnv.entries.map(([k, v]) => `${k}=${v}`),
+    ],
+    dropped: projectEnv.dropped,
+  };
+}
+
 export class DockerRuntime implements RuntimeAdapter {
   readonly name: string = "docker";
   readonly capabilities: ReadonlySet<RuntimeCapability> = new Set<RuntimeCapability>([
@@ -1093,6 +1119,7 @@ export class DockerRuntime implements RuntimeAdapter {
     // through it cannot reach the host. Bare deliberately does NOT declare this.
     "isolatedExec",
     "dockerHost",
+    "releaseCommand",
   ]);
 
   /** Docker honors every extended compose key we currently support. */
@@ -3481,21 +3508,15 @@ export class DockerRuntime implements RuntimeAdapter {
 
     const containerName = `openship-${config.runtimeName || config.projectId}-${config.deploymentId}`;
 
-    // Environment variables. A worker (config.portless) listens on nothing, so
-    // injecting PORT would be a lie the app might bind to — omit it there (#538-B).
-    const projectEnv = splitRuntimeEnv(config.envVars);
-    if (projectEnv.dropped.length > 0) {
+    // Environment variables — shared with runReleaseCommand, see deploymentContainerEnv.
+    const { env, dropped } = deploymentContainerEnv(config);
+    if (dropped.length > 0) {
       log({
         timestamp: new Date().toISOString(),
         level: "warn",
-        message: droppedRuntimeEnvMessage(projectEnv.dropped),
+        message: droppedRuntimeEnvMessage(dropped),
       });
     }
-    const env = [
-      ...(config.portless ? [] : [`PORT=${config.port}`]),
-      `NODE_ENV=${config.environment === "production" ? "production" : "development"}`,
-      ...projectEnv.entries.map(([k, v]) => `${k}=${v}`),
-    ];
 
     // Start command - if provided, split into Cmd array
     const cmd = config.startCommand ? ["sh", "-c", config.startCommand] : undefined;
@@ -3627,6 +3648,160 @@ export class DockerRuntime implements RuntimeAdapter {
       containerId: container.id,
       status: "running",
     };
+  }
+
+  /**
+   * Run one release command in a THROWAWAY container off the freshly-built
+   * image, before anything is activated.
+   *
+   * A one-off container, not an exec into the running deployment: at this point
+   * in the pipeline the new version isn't running yet and the old one is still
+   * serving — `exec`ing there would run the new release's migrations inside the
+   * OLD image, and a failure would take a healthy container down with it.
+   *
+   * Env / mounts / network mirror `deploy` above so a migration reaches the same
+   * database and writes to the same volume the app will read from. Deliberately
+   * NOT mirrored: the published port (a release command must never contend with
+   * the running app for the loopback pin) and the restart policy (a one-off
+   * command that exits non-zero must fail, not bounce).
+   */
+  async runReleaseCommand(
+    config: DeployConfig,
+    command: string,
+    onLog: LogCallback,
+    opts?: ReleaseCommandOptions,
+  ): Promise<void> {
+    if (!config.imageRef) {
+      throw new Error("Release commands require an imageRef (built image tag)");
+    }
+    const deadline = releaseCommandDeadline(opts);
+    const name = `openship-release-${config.deploymentId}-${randomUUID()}`;
+    let container: Dockerode.Container | undefined;
+    let creating = false;
+    let finished = false;
+    let stream: Readable | undefined;
+    const sinks: Writable[] = [];
+
+    // Cleanup has its own budget: the command's signal is already aborted on
+    // cancellation. Remove anonymous scratch volumes; Docker preserves named
+    // volumes and bind mounts shared with the application.
+    const remove = async (target: Dockerode.Container) => {
+      try {
+        await withTimeout(target.remove({ force: true, v: true, abortSignal: AbortSignal.timeout(5_000) }),
+          5_000, "Release container cleanup timed out");
+      } catch (error) {
+        if (!isDockerNotFoundError(error)) onLog({
+          timestamp: new Date().toISOString(), level: "warn",
+          message: `Could not confirm cleanup of release container ${name}: ${safeErrorMessage(error)}\n`,
+        });
+      }
+    };
+
+    try {
+      deadline.signal.throwIfAborted();
+      const { env, dropped } = deploymentContainerEnv(config);
+      if (dropped.length > 0) onLog({
+        timestamp: new Date().toISOString(), level: "warn",
+        message: droppedRuntimeEnvMessage(dropped),
+      });
+      const scopedBinds = scopeVolumeBinds(
+        config.slug || config.runtimeName || config.projectId, config.volumes ?? [], true,
+      );
+      const networkId = config.networkAlias
+        ? await deadline.wait(() => this.ensureNetwork(
+            config.slug || config.runtimeName || config.projectId, deadline.signal,
+          ))
+        : undefined;
+
+      container = await deadline.wait(async () => {
+        creating = true;
+        const candidate = await this.docker.createContainer({
+          name,
+          Image: config.imageRef,
+          Entrypoint: ["/bin/sh", "-c"],
+          Cmd: [command],
+          Env: env,
+          Tty: false,
+          // This is temporary build-session work, not an activated deployment.
+          // Reuse builder ownership so cancellation/teardown can reclaim it and
+          // deployment discovery cannot mistake a migration for the live app.
+          Labels: this.labels({ sessionId: config.buildSessionId, projectId: config.projectId }),
+          HostConfig: {
+            Binds: scopedBinds.length > 0 ? scopedBinds : undefined,
+            ...(networkId ? { NetworkMode: networkId } : {}),
+            ...dockerResourceLimits(config.resources),
+            LogConfig: DEFAULT_CONTAINER_LOG_CONFIG,
+          },
+          abortSignal: deadline.signal,
+        });
+        // A transport may deliver the create response after cancellation. The
+        // caller has already unwound, so reclaim this late result here as well.
+        if (finished) await remove(candidate);
+        return candidate;
+      });
+      await deadline.wait(() => opts?.beforeStart?.(container!.id) ?? Promise.resolve());
+      await deadline.wait(() => container!.start({ abortSignal: deadline.signal }));
+      stream = await deadline.wait(async () => {
+        const output = await container!.logs({
+          stdout: true, stderr: true, follow: true, abortSignal: deadline.signal,
+        }) as unknown as Readable;
+        if (finished) output.destroy();
+        return output;
+      });
+
+      // Use the shared streaming parser: a Docker header or a UTF-8 character
+      // can straddle transport chunks. Retain only a bounded error tail.
+      let tail = "";
+      const streamDone = new Promise<void>((resolve, reject) => {
+        const sink = (level: "info" | "warn") => {
+          const decoder = new StringDecoder("utf8");
+          const emit = (text: string, raw?: Buffer) => {
+            tail = (tail + text).slice(-4000);
+            if (text || raw?.length) onLog({
+              timestamp: new Date().toISOString(), message: text, level,
+              ...(raw ? { rawData: raw.toString("base64") } : {}),
+            });
+          };
+          const output = new Writable({
+            write(chunk: Buffer, _encoding, callback) {
+              try { emit(decoder.write(chunk), chunk); callback(); }
+              catch (error) { callback(error as Error); }
+            },
+            final(callback) { emit(decoder.end()); callback(); },
+          });
+          output.on("error", reject);
+          sinks.push(output);
+          return output;
+        };
+        demuxDockerStream(stream!, sink("info"), sink("warn"), reject);
+        stream!.once("end", () => { sinks.forEach(output => output.end()); resolve(); });
+        stream!.once("close", () => {
+          if (!stream!.readableEnded) reject(new Error("Release command log stream closed before completion"));
+        });
+      });
+      // A log transport failure must also interrupt a still-running command.
+      const [status] = await deadline.wait(() => {
+        const completion = container!.wait({ abortSignal: deadline.signal }).then(async status => {
+          await withTimeout(streamDone, 5_000, "Could not finish reading release command output");
+          return status;
+        });
+        return Promise.all([completion, streamDone]);
+      });
+      if (status.StatusCode !== 0) {
+        throw new Error(`Release command failed with exit code ${status.StatusCode}` +
+          (tail.trim() ? `\n${tail.trim().slice(-1000)}` : ""));
+      }
+    } catch (error) {
+      deadline.abort(error);
+      throw error;
+    } finally {
+      finished = true;
+      deadline.dispose();
+      stream?.destroy();
+      sinks.forEach(sink => sink.destroy());
+      // The name lets us clean up even if the create response was lost.
+      if (creating) await remove(container ?? this.docker.getContainer(name));
+    }
   }
 
   async stop(containerId: string): Promise<void> {
@@ -4939,24 +5114,28 @@ export class DockerRuntime implements RuntimeAdapter {
    * All services in a compose project share this network and can
    * reach each other by service name as hostname.
    */
-  async ensureNetwork(slug: string): Promise<string> {
+  async ensureNetwork(slug: string, signal?: AbortSignal): Promise<string> {
     const networkName = `openship-${slug}`;
     // list-then-create is check-then-act: two concurrent deploys for the same
     // slug would both miss and both create, yielding two networks with the same
     // name (Docker allows it) and ambiguous name lookups. Serialize per server.
     const critical = async () => {
+      signal?.throwIfAborted();
       const networks = await this.docker.listNetworks({
         filters: { name: [networkName] },
+        ...(signal ? { abortSignal: signal } : {}),
       });
 
       // listNetworks does substring matching, verify exact name
       const existing = networks.find((n) => n.Name === networkName);
       if (existing) return existing.Id;
 
+      signal?.throwIfAborted();
       const network = await this.docker.createNetwork({
         Name: networkName,
         Driver: "bridge",
         Labels: { "openship.network": slug },
+        ...(signal ? { abortSignal: signal } : {}),
       });
       return network.id;
     };
@@ -5176,12 +5355,12 @@ export class DockerRuntime implements RuntimeAdapter {
     projectId: string,
     networkNames: string[],
     extraContainerIds: string[] = [],
-    options?: { prunePrefix?: string; retain?: string[]; strict?: boolean },
+    options?: { prunePrefix?: string; retain?: string[]; strict?: boolean; onlyContainerIds?: string[] },
   ): Promise<void> {
     if (networkNames.length === 0 && !options?.prunePrefix) return;
     let containers: Awaited<ReturnType<typeof this.docker.listContainers>>;
     try {
-      containers = await this.docker.listContainers({
+      containers = options?.onlyContainerIds ? [] : await this.docker.listContainers({
         all: true,
         filters: { label: [`openship.project=${projectId}`] },
       });
@@ -5202,9 +5381,10 @@ export class DockerRuntime implements RuntimeAdapter {
      * So the caller may name containers explicitly — the same identity chain the READ paths
      * use (stored container id, not label) — and they are unioned in, de-duped by id.
      */
-    if (extraContainerIds.length > 0) {
+    const includedContainerIds = options?.onlyContainerIds ?? extraContainerIds;
+    if (includedContainerIds.length > 0) {
       const seen = new Set(containers.map((c) => c.Id));
-      for (const id of extraContainerIds) {
+      for (const id of includedContainerIds) {
         if (seen.has(id)) continue;
         try {
           const info = await this.docker.getContainer(id).inspect();
@@ -5216,7 +5396,7 @@ export class DockerRuntime implements RuntimeAdapter {
           seen.add(info.Id);
         } catch (error) {
           // A recorded container may already have been replaced by this deploy.
-          if (options?.strict && !isDockerNotFoundError(error)) throw error;
+          if (options?.onlyContainerIds || (options?.strict && !isDockerNotFoundError(error))) throw error;
         }
       }
     }
