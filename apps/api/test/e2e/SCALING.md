@@ -19,17 +19,19 @@ only the fixture's containers, volumes and network.
 
 `scaling-full-cycle.e2e.test.ts` exercises:
 
-- Real HTTP authentication, project cluster selection and deployment admission.
+- Real MCP discovery and JSON-RPC dispatch, HTTP authentication, project cluster
+  selection and deployment admission. MCP uses the same engine paths as the SDK.
 - Source build, authenticated image publication and pulling on different nodes.
 - Deployment progress over SSE, disconnect and reconnect without duplicate work.
 - Public requests through the shipped Edge and the production route writer.
-- Scaling from one to three instances and back, without rebuilding.
+- Scaling from one to three instances and back through MCP, without rebuilding;
+  stale deployment/timestamp guards are rejected.
 - Internal DNS and Service access from an actual application pod.
-- Environment changes, an application update and retained-image rollback.
+- Environment changes, an application update and retained-image rollback through MCP.
 - Requests during scale, update, rollback and failed deployment operations.
-- Cancellation, a real crashing workload and explicit redeployment.
+- MCP cancellation, a real crashing workload and explicit redeployment.
 - Worker unavailability and recovery, plus Kubernetes replacing a deleted pod.
-- Project deletion, owned namespace cleanup and removal of its public route.
+- MCP project deletion, owned namespace cleanup and removal of its public route.
 
 The crash test shortens the workload's native progress deadline to 20 seconds.
 Kubernetes still produces the failure; the test never fabricates a status.
@@ -46,6 +48,13 @@ the SSH/systemd installer, provider firewalls, WireGuard provisioning, a
 three-control-server quorum, controller-process crash recovery, browser clicks
 or ACME issuance. Database operators and database migration/recovery also need
 their own acceptance suite.
+
+`test/modules/mcp/mcp-infrastructure-cycle.test.ts` separately exercises native
+network registration/verification, compute-cluster creation, k3s setup failure,
+idempotent reattachment, retry, status/logs and dependency-ordered removal through
+MCP, real authorization, the database and engine. That fast integration fixture
+substitutes host adapters and scheduling; it does not prove SSH installation on
+real hosts. Policy-driven autoscaling and live worker joining are not implemented.
 
 The release gate calls `.github/workflows/scaling-e2e.yml` and requires it to pass
 before publishing. Routine pull request and `main` CI runs keep the unit/integration

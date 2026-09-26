@@ -12,8 +12,10 @@ import {
   type CheckedResourceType,
 } from "../../lib/permission";
 import type { Permission } from "@repo/db";
-import { Type } from "@sinclair/typebox";
+import { Type, type TSchema } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import { env } from "@repo/platform/engine/config/index";
+import { mcpToolName } from "./mcp-name.mjs";
 
 /** IDs become HTTP headers: reject empty, whitespace and control characters. */
 export const McpOrganizationIdSchema = Type.String({
@@ -21,7 +23,8 @@ export const McpOrganizationIdSchema = Type.String({
   maxLength: 512,
   // Unlike $, the final assertion cannot match before a trailing newline.
   pattern: "^[!-~]+(?![\\s\\S])",
-  description: "Openship workspace ID from get_permissions_workspaces. Fixes this call to that workspace within the credential's access. Omit to use the credential/account default.",
+  description:
+    "Openship workspace ID from get_permissions_workspaces. Fixes this call to that workspace within the credential's access. Omit to use the credential/account default.",
 });
 
 /**
@@ -111,8 +114,6 @@ export interface McpPrincipal {
  */
 const HARD_DENY = new Set(["tokens", "auth", "mcp"]);
 
-const BODY_METHODS = new Set(["POST", "PUT", "PATCH"]);
-
 function includeRoute(route: RegisteredRoute): boolean {
   const spec = route.spec;
   if (isPublicSpec(spec)) return false;
@@ -136,61 +137,61 @@ function extractPathParams(path: string): string[] {
 
 /** Stable, unique, MCP-safe tool name from method + path. */
 function toolName(route: RegisteredRoute, taken: Set<string>): string {
-  const segments = route.path
-    .split("/")
-    .filter((s) => s && s !== "api")
-    .map((s) => (s.startsWith(":") ? `by_${s.slice(1)}` : s.replace(/[^a-z0-9]+/gi, "_")));
-  const base = [route.method.toLowerCase(), ...segments].join("_").replace(/_+/g, "_").slice(0, 64);
-  let name = base;
-  let n = 2;
-  while (taken.has(name)) {
-    name = `${base.slice(0, 60)}_${n++}`;
-  }
+  const name = mcpToolName(route.method, route.path);
+  if (taken.has(name)) throw new Error(`MCP tool name collision: ${name}`);
   taken.add(name);
   return name;
 }
 
 function inputSchema(
   pathParams: string[],
-  hasBody: boolean,
-  bodySchema?: Record<string, unknown>,
+  bodySchema?: TSchema,
+  querySchema?: TSchema,
 ): Record<string, unknown> {
-  const properties: Record<string, unknown> = {};
+  const properties: Record<string, TSchema> = {};
   for (const p of pathParams) {
-    properties[p] = { type: "string", description: `Path parameter :${p}` };
+    properties[p] = Type.String({
+      minLength: 1,
+      description: `The ${p} from the resource's list or detail response.`,
+    });
   }
-  properties.organizationId = McpOrganizationIdSchema;
-  properties.query = { type: "object", description: "Optional query-string parameters", additionalProperties: true };
-  if (hasBody && bodySchema) {
-    // Emit the route's TypeBox body schema (JSON Schema at runtime) verbatim.
-    // Convention: a mutating MCP route that takes a structured body declares it
-    // via `spec.body` (which also drives auto-validation); one with NO `spec.body`
-    // is a no-body action and advertises no `body` param at all — never a
-    // permissive blob that would make an agent guess at fields that don't exist.
-    // So "add a typed body to an MCP tool" == "add spec.body to its route".
-    properties.body = bodySchema;
+  properties.organizationId = Type.Optional(McpOrganizationIdSchema);
+  const query =
+    querySchema ??
+    Type.Record(
+      Type.String(),
+      Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]),
+      { description: "Query-string parameters supported by this endpoint." },
+    );
+  properties.query = Value.Check(query, {}) ? Type.Optional(query) : query;
+  if (bodySchema) {
+    // Optional all-default inputs are sent as {}. Required inputs, including
+    // revision/sequence guards on DELETE, must be supplied by the caller.
+    properties.body = Value.Check(bodySchema, {}) ? Type.Optional(bodySchema) : bodySchema;
   }
-  return {
-    type: "object",
-    properties,
-    required: pathParams,
-    additionalProperties: false,
-  };
+  return Type.Object(properties, { additionalProperties: false });
 }
 
-function annotationsFor(route: RegisteredRoute): { readOnlyHint: boolean; destructiveHint: boolean } {
+function annotationsFor(route: RegisteredRoute): {
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+} {
   const spec = route.spec;
   if (isPublicSpec(spec)) return { readOnlyHint: true, destructiveHint: false };
   const parsed = parsePermissionTag(spec.tag);
-  const readOnlyHint = parsed.action === "read" || parsed.isList || spec.readOnly === true;
+  const readOnlyHint = route.method === "GET" || spec.readOnly === true;
   const destructiveHint =
-    route.method === "DELETE" ||
-    parsed.action === "admin" ||
-    /delete|teardown|destroy|remove|wipe|revoke/i.test(route.path);
+    !readOnlyHint &&
+    (spec.mcp?.destructive ??
+      (route.method === "DELETE" ||
+        parsed.action === "admin" ||
+        /delete|teardown|destroy|remove|wipe|revoke/i.test(route.path)));
   return { readOnlyHint, destructiveHint };
 }
 
 let cached: McpToolDef[] | null = null;
+let cachedMode: boolean | undefined;
+let cachedRouteCount = -1;
 
 /**
  * Drop the memo. The registry is populated as a side effect of importing route
@@ -207,10 +208,23 @@ export function resetMcpToolCache(): void {
 
 /** All curated tools, generated once from the route registry. */
 export function getMcpTools(): McpToolDef[] {
-  if (cached) return cached;
+  const routes = getRouteRegistry();
+  if (cached && cachedMode === env.CLOUD_MODE && cachedRouteCount === routes.length) return cached;
+  cachedMode = env.CLOUD_MODE;
+  cachedRouteCount = routes.length;
   const taken = new Set<string>();
-  cached = getRouteRegistry()
+  const endpoints = new Set<string>();
+  cached = routes
     .filter(includeRoute)
+    .filter((route) => {
+      // Mode-specific billing routers share a method/path and handler contract.
+      // Importing public plans registers the Cloud router even on self-hosted
+      // instances. Advertise the endpoint once, never an order-dependent _2 tool.
+      const key = `${route.method} ${route.path.replace(/\/+$/, "")}`;
+      if (endpoints.has(key)) return false;
+      endpoints.add(key);
+      return true;
+    })
     .map((route): McpToolDef => {
       const spec = route.spec;
       // includeRoute already excluded public specs, so spec is a PermissionSpec.
@@ -220,15 +234,16 @@ export function getMcpTools(): McpToolDef[] {
       const collectionProject = !isPublicSpec(spec) && !!spec.collectionProject;
       const leaf = parsed?.leaf ?? "";
       const pathParams = extractPathParams(route.path);
-      const hasBody = BODY_METHODS.has(route.method);
-      // Single-source body schema: the top-level `spec.body` (which also drives
-      // auto-validation) wins; `mcp.body` is a deprecated fallback.
-      const specBody = isPublicSpec(spec) ? undefined : spec.body;
-      const bodySchema = (specBody ?? mcp?.body) as Record<string, unknown> | undefined;
+      const bodySchema = isPublicSpec(spec) ? undefined : spec.body;
+      const hasBody = !!bodySchema && route.method !== "GET";
       return {
         name: toolName(route, taken),
         description: mcp?.description ?? `${route.method} ${route.path}`,
-        inputSchema: inputSchema(pathParams, hasBody, hasBody ? bodySchema : undefined),
+        inputSchema: inputSchema(
+          pathParams,
+          hasBody ? bodySchema : undefined,
+          isPublicSpec(spec) ? undefined : spec.query,
+        ),
         annotations: annotationsFor(route),
         method: route.method,
         path: route.path,
@@ -242,19 +257,21 @@ export function getMcpTools(): McpToolDef[] {
           // a list/collection wildcard — but it CAN pass an org-singleton one when
           // it holds a grant on that singleton type, so `filterToolsForPrincipal`
           // treats those two cases differently (see its wildcard branch).
-          // A list / collection / org-singleton op is org-wide ONLY
-          // when it carries no path params. WITH path params (e.g.
-          // /repos/:owner/:repo/branches, /projects/:id/deployments) it is
-          // scoped to a specific resource, so a grant on that resource's root
-          // type enables it — those must stay listable for scoped tokens.
+          // Network operations use collection authority even with operation IDs
+          // in the path. GitHub repository paths are the singleton exception:
+          // their shared operations authorize the named repository/account.
           // A `collectionProject` route is org-wide in SHAPE (no :id) but scoped
           // in EFFECT — its handler authorizes the project named in the body, so
           // a grant on that project is enough and it must stay listable.
           wildcard:
             !collectionProject &&
-            ((parsed?.isList ?? false) || collection || ORG_SINGLETON_RESOURCES.has(leaf)) &&
-            pathParams.length === 0,
-          grantRoot: PROJECT_ROOTED.has(leaf as CheckedResourceType) ? "project" : (parsed?.root ?? ""),
+            ((collection && parsed?.root === parsed?.leaf) ||
+              (ORG_SINGLETON_RESOURCES.has(leaf) &&
+                !(leaf === "github" && pathParams.length > 0)) ||
+              ((parsed?.isList ?? false) && pathParams.length === 0)),
+          grantRoot: PROJECT_ROOTED.has(leaf as CheckedResourceType)
+            ? "project"
+            : (parsed?.root ?? ""),
           projectCreate: !isPublicSpec(spec) && spec.projectCreate === true,
           // Repo content tier, declared once on the route and consumed both here
           // (advertisement) and by requirePermission (enforcement).
@@ -313,7 +330,10 @@ function principalHasGrantFor(granted: ReadonlySet<string>, grantRoot: string): 
  * `principal.canCreateProjects`: such a token may CREATE projects and LIST its
  * own, mirroring both arms of the runtime check in permission.ts.
  */
-export function filterToolsForPrincipal(tools: McpToolDef[], principal: McpPrincipal): McpToolDef[] {
+export function filterToolsForPrincipal(
+  tools: McpToolDef[],
+  principal: McpPrincipal,
+): McpToolDef[] {
   return tools.filter((t) => {
     // Read-only tokens can only call GET — the runtime gate rejects mutations by
     // HTTP method, so mirror that exactly rather than guessing from the tag.

@@ -267,13 +267,8 @@ export type RateLimitPolicyId = PolicyId;
 export interface McpRouteMeta {
   /** Agent-facing tool description. */
   description: string;
-  /**
-   * @deprecated Declare the body schema ONCE via the top-level `spec.body`
-   * field instead — secureRouter auto-wires `tbValidator` from it AND the MCP
-   * layer reads it as the tool's body params, so there is a single source. This
-   * field is kept only as a fallback for the (now migrated) legacy call sites.
-   */
-  body?: TSchema;
+  /** Override the inferred hint for actions such as destructive migration cutover. */
+  destructive?: boolean;
 }
 
 export interface PermissionSpec {
@@ -389,6 +384,14 @@ export interface PermissionSpec {
   localOnly?: boolean;
   /** Opt this route into the MCP tool surface. See {@link McpRouteMeta}. */
   mcp?: McpRouteMeta;
+  /** Why this HTTP endpoint is intentionally not an MCP tool (checked by docs:check). */
+  mcpExcluded?: string;
+  /**
+   * Decoded query parameters advertised to MCP clients. Reuse the operation's
+   * input schema; the HTTP adapter still parses strings and the shared operation
+   * validates them. This is not a second HTTP query validator.
+   */
+  query?: TSchema;
   /**
    * TypeBox schema for the JSON request body. Declared ONCE here and consumed
    * in two places — no duplication:
@@ -396,7 +399,6 @@ export interface PermissionSpec {
    *      handlers (so every body-carrying route validates by construction).
    *   2. The MCP layer emits it verbatim as the tool's `body` params (TypeBox
    *      *is* JSON Schema, so there's no second contract to keep in sync).
-   * Prefer this over the deprecated `mcp.body`.
    */
   body?: TSchema;
   /** The shared operation validates this same schema. Keeps its optional-input

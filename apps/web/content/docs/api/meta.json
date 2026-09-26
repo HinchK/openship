@@ -36,6 +36,7 @@
     "credentials",
     "settings",
     "mcp",
+    "mcp-tools",
     "---Infrastructure---",
     "servers",
     "system",

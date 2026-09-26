@@ -11,9 +11,9 @@
  * dashboard branching on deploy mode.
  */
 import { Hono } from "hono";
+import { IssueCollectionSchemas, IssueJobSchemas } from "@repo/contracts";
 import { secureRouter } from "../../lib/secure-router";
 import * as ctrl from "./issues.controller";
-import { IssueJobSchemas } from "@repo/contracts";
 
 const r = secureRouter(new Hono(), {
   module: "issues",
@@ -28,6 +28,7 @@ r.get(
       description:
         "THE place to answer \"what is broken right now?\" across the whole installation — start here before per-project tools. One org-wide feed that merges every check Openship already runs: container health incidents (unhealthy / crash_loop / down, plus a server-level `server_unreachable` row when a whole box is offline), managed edge/mail container state, deploy blockers and held prompts, partial-release decisions, unsynced routing, port advisories, unverified domains, certificate errors, and available updates. Each item carries `severity` (`outage` = not being served right now, `action_required`, `advisory`), a `target` with a dashboard href, and `resolveWith` — concrete {method, path} calls that fix it, callable as-is. Items whose fix is a managed container carry `infraFix` instead (a UI flow, not an API call). `?status=resolved` returns incident HISTORY (the only source with a lifecycle; up to 30 days), so a resolved-tab absence never means \"nothing else ever broke\". Infrastructure rows require server read access and are absent in cloud mode.",
     },
+    query: IssueCollectionSchemas.list.input,
   },
   ctrl.listIssues,
 );
@@ -97,7 +98,7 @@ r.post(
 
 r.get(
   "/rescan/status",
-  { tag: "job:read", localOnly: true },
+  { tag: "job:read", localOnly: true, mcp: { description: "Read the current or most recent issue-rescan session, including stage status, errors and completion. Start once with the rescan tool, then poll this tool instead of launching repeated scans." } },
   ctrl.rescanStatus,
 );
 
