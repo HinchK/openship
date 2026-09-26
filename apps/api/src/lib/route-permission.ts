@@ -76,7 +76,7 @@ export type PermissionTag = string; // keep wide; the parser validates structura
  * Resource → URL param-name convention. The middleware reads the id from
  * `c.req.param(paramName)`. Overridable per route.
  */
-const DEFAULT_ID_PARAMS: Record<string, string> = {
+export const DEFAULT_ID_PARAMS: Readonly<Record<string, string>> = {
   project: "id",
   deployment: "id",
   domain: "id",
@@ -127,7 +127,7 @@ export { ORG_SINGLETON_RESOURCES };
  * controller is still responsible for performing org-wide reasoning
  * safely (no implicit cross-tenant access).
  */
-const CONDITIONAL_SINGLETON_RESOURCES = new Set<string>([
+export const CONDITIONAL_SINGLETON_RESOURCES: ReadonlySet<string> = new Set([
   "domain",
   "mail_server",
 ]);
@@ -453,8 +453,8 @@ export function isPublicSpec(spec: RouteSpec): spec is PublicSpec {
  * tell-tale `github '*' not found`.
  *
  * Deliberately limited to read/list. Write/admin GitHub routes (create or
- * delete repo, disconnect, instance-token) keep the org-wide check on
- * `{github,"*"}`, and MCP exposes no GitHub mutations.
+ * delete repo, disconnect, instance-token) use their existing route or shared
+ * operation authority; this helper does not authorize them.
  *
  * Be precise about what that org-wide check buys, because it is easy to misread as
  * a defense it is not: it is strict only for a RESTRICTED principal (a scoped

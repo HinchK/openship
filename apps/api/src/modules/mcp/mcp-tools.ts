@@ -3,6 +3,8 @@ import {
   isPublicSpec,
   parsePermissionTag,
   ORG_SINGLETON_RESOURCES,
+  CONDITIONAL_SINGLETON_RESOURCES,
+  DEFAULT_ID_PARAMS,
   type RegisteredRoute,
 } from "../../lib/route-permission";
 import {
@@ -30,7 +32,7 @@ export const McpOrganizationIdSchema = Type.String({
 /**
  * MCP tool generation from the HTTP route registry. A route is exposed as a
  * tool ONLY if its spec declares an `mcp` block (opt-in allowlist) — the
- * description and body-param schema come from there, co-located with the route.
+ * description and argument schemas are co-located with the route.
  * Each tool's handler dispatches an internal request through the real Hono app
  * (see mcp-dispatch.ts), so no business logic is duplicated here.
  */
@@ -234,6 +236,10 @@ export function getMcpTools(): McpToolDef[] {
       const collectionProject = !isPublicSpec(spec) && !!spec.collectionProject;
       const leaf = parsed?.leaf ?? "";
       const pathParams = extractPathParams(route.path);
+      const leafParam =
+        (isPublicSpec(spec) ? undefined : spec.ids?.[leaf]) ?? DEFAULT_ID_PARAMS[leaf] ?? "id";
+      const namedGithubTarget =
+        leaf === "github" && (pathParams.includes("owner") || pathParams.includes("org"));
       const bodySchema = isPublicSpec(spec) ? undefined : spec.body;
       const hasBody = !!bodySchema && route.method !== "GET";
       return {
@@ -253,22 +259,23 @@ export function getMcpTools(): McpToolDef[] {
           root: parsed?.root ?? "",
           leaf,
           action: (parsed?.action ?? "read") as string,
-          // "wildcard" = operates on the WHOLE org. A scoped token can never pass
-          // a list/collection wildcard — but it CAN pass an org-singleton one when
-          // it holds a grant on that singleton type, so `filterToolsForPrincipal`
-          // treats those two cases differently (see its wildcard branch).
+          // "wildcard" = operates on the whole org and needs an explicit
+          // wildcard grant for a restricted principal, including its action.
           // Network operations use collection authority even with operation IDs
           // in the path. GitHub repository paths are the singleton exception:
           // their shared operations authorize the named repository/account.
+          // A top-level :list still requires a wildcard when its path contains
+          // a catalog/mail-server ID. Conditional singletons use the same
+          // resource-ID parameter mapping as requirePermission.
           // A `collectionProject` route is org-wide in SHAPE (no :id) but scoped
           // in EFFECT — its handler authorizes the project named in the body, so
           // a grant on that project is enough and it must stay listable.
           wildcard:
             !collectionProject &&
             ((collection && parsed?.root === parsed?.leaf) ||
-              (ORG_SINGLETON_RESOURCES.has(leaf) &&
-                !(leaf === "github" && pathParams.length > 0)) ||
-              ((parsed?.isList ?? false) && pathParams.length === 0)),
+              ((ORG_SINGLETON_RESOURCES.has(leaf) || (parsed?.isList && parsed.root === leaf)) &&
+                !namedGithubTarget) ||
+              (CONDITIONAL_SINGLETON_RESOURCES.has(leaf) && !pathParams.includes(leafParam))),
           grantRoot: PROJECT_ROOTED.has(leaf as CheckedResourceType)
             ? "project"
             : (parsed?.root ?? ""),

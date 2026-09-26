@@ -245,6 +245,30 @@ describe("MCP route input and transport contracts", () => {
     expect(names).not.toContain("post_system_compute_clusters");
   });
 
+  it("matches wildcard gates for catalog reads and mail collections without hiding resource reads", () => {
+    const principal = {
+      role: "restricted" as const,
+      readOnly: false,
+      canCreateProjects: false,
+      grantedRootTypes: new Set(["project", "mail_server"]),
+      wildcardGrants: new Map(),
+    };
+    const names = filterToolsForPrincipal(getMcpTools(), principal).map((tool) => tool.name);
+    expect(names).toContain("get_mail_admin_by_serverId_mailboxes_by_email");
+    expect(names).toContain("get_domains");
+    expect(names).not.toContain("get_mail_admin_by_serverId_mailboxes");
+    expect(names).not.toContain("get_mail_status");
+    expect(names).not.toContain("get_apps_catalog_by_id");
+    expect(names).not.toContain("post_domains_preview");
+    principal.wildcardGrants.set("mail_server", ["read"]);
+    const withMailReads = filterToolsForPrincipal(getMcpTools(), principal).map(
+      (tool) => tool.name,
+    );
+    expect(withMailReads).toContain("get_mail_admin_by_serverId_mailboxes");
+    expect(withMailReads).toContain("get_mail_status");
+    expect(withMailReads).not.toContain("post_mail_scan");
+  });
+
   it("all workflow references resolve to real tools and unavailable cluster flows stay off Cloud", () => {
     for (const name of [
       "cluster-and-scale",
